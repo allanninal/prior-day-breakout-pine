@@ -1,0 +1,157 @@
+// This source code is subject to the terms of the PolyForm Noncommercial License 1.0.0
+// https://polyformproject.org/licenses/noncommercial/1.0.0/
+// © allanninal
+
+//@version=6
+
+//@description Prior Day Breakout: the previous trading day's high and low, and a breakout trade on the first close
+// beyond either one. Buy on the first close above the previous-day high, sell on the first close below the low, once per
+// side per day, from 01:00 to 20:00 server time; stop on the other side of the previous-day range, target a multiple of
+// the stop distance (R), flat at 23:00. Closed bars only. The exact rules are tests/reference.py.
+strategy("Prior Day Breakout", shorttitle = "PDB", overlay = true, initial_capital = 10000, default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0, process_orders_on_close = true, commission_type = strategy.commission.percent, commission_value = 0.01, slippage = 20, margin_long = 1, margin_short = 1, max_lines_count = 500, max_labels_count = 500)
+// process_orders_on_close: the order is sent when the signal bar closes and fills at that close, the moment a live
+// alert would fire. In a continuous market that close is the next bar's open, the fill price of the MetaTrader editions.
+// Costs: commission 0.01% and 20 ticks of slippage per fill are placeholders; set your own in Properties.
+// margin 1% (1:100 leverage) so a fixed size is never cut by the margin check.
+
+// ───────────────────────────── Constants ─────────────────────────────
+const int FROM_MIN  = 60          // signals from bars opening at 01:00 server time
+const int TO_MIN    = 20 * 60     // no new entry from 20:00
+const int FLAT_MIN  = 23 * 60     // flat at 23:00 on the day of the entry
+const int MAX_GAP   = 7           // the previous trading day may be up to 7 calendar days back (weekends, holidays)
+const int DAY_MS    = 86400000
+
+const string PRESET_AUTO   = "Validated preset for this chart (recommended)"
+const string PRESET_CUSTOM = "The target below"
+
+const string GROUP_RULE  = "Rule"
+const string GROUP_CLOCK = "Server day"
+const string GROUP_SIZE  = "Order size"
+const string GROUP_SHOW  = "Display"
+
+// ───────────────────────────── Inputs ─────────────────────────────
+string presetMode = input.string(PRESET_AUTO, "Settings", options = [PRESET_AUTO, PRESET_CUSTOM], group = GROUP_RULE, tooltip = "Validated presets: XAUEUR 1 hour with a 2 R target and XAUEUR 15 minutes with a 1 R target (the settings that passed both backtests of the MetaTrader edition). On any other chart the target below is used.")
+float  targetIn   = input.float(2.0, "Target, x the stop distance (R)", minval = 0.1, step = 0.1, group = GROUP_RULE, tooltip = "Take profit at this multiple of the distance from the entry to the stop. Used when Settings is 'The target below' or the chart is not a validated preset.")
+
+string dayTz    = input.string("America/New_York", "Day time zone", group = GROUP_CLOCK, inline = "clock", tooltip = "The trading day the levels are taken from. Default: the day starts at 17:00 New York time (New York + 7 hours = 00:00), the server day most MetaTrader brokers use, so the levels match theirs. For a midnight-UTC day use UTC and 0.")
+int    dayShift = input.int(7, "+ hours", minval = -12, maxval = 14, group = GROUP_CLOCK, inline = "clock")
+
+float qtyIn = input.float(1.0, "Units per trade", minval = 0.0001, group = GROUP_SIZE, tooltip = "A fixed order size in the symbol's units (for gold: ounces). The same size on every trade.")
+
+bool  showLevels = input.bool(true, "Previous-day high and low", group = GROUP_SHOW, tooltip = "Draw the levels of the previous trading day for each day.")
+bool  showTable  = input.bool(true, "Status table", group = GROUP_SHOW, tooltip = "A small table in the top-right corner: settings, levels and position.")
+color highColor  = input.color(#089981, "High", group = GROUP_SHOW, inline = "colors")
+color lowColor   = input.color(#F23645, "Low", group = GROUP_SHOW, inline = "colors")
+
+// ───────────────────────────── Functions ─────────────────────────────
+//@function Server-day number (days since 1970) of a moment, in the chosen day time zone and shift.
+//@param t A UNIX time in milliseconds.
+//@returns The day number.
+dayOf(int t) =>
+    int s = t + dayShift * 3600000
+    int(timestamp("UTC", year(s, dayTz), month(s, dayTz), dayofmonth(s, dayTz)) / DAY_MS)
+
+//@function Minutes since the start of the server day.
+//@param t A UNIX time in milliseconds.
+//@returns 0 to 1439.
+minuteOf(int t) =>
+    int s = t + dayShift * 3600000
+    hour(s, dayTz) * 60 + minute(s, dayTz)
+
+//@function The validated target for this chart, or na when the chart is not a validated preset.
+//@returns 2.0 on XAUEUR 1 hour, 1.0 on XAUEUR 15 minutes, na otherwise.
+presetTarget() =>
+    bool gold = str.startswith(syminfo.ticker, "XAUEUR")
+    gold and timeframe.period == "60" ? 2.0 : gold and timeframe.period == "15" ? 1.0 : na
+
+// ───────────────────────────── Previous-day levels ─────────────────────────────
+float autoTarget = presetTarget()
+bool  validated  = presetMode == PRESET_AUTO and not na(autoTarget)
+float targetR    = validated ? autoTarget : targetIn
+
+int  barDay = dayOf(time)
+int  barMin = minuteOf(time)
+
+var int   firstDay = barDay        // the chart's first day is usually cut: it never serves as a previous day
+var int   curDay   = na
+var float curHi    = na
+var float curLo    = na
+var int   prevDay  = na
+var float prevHi   = na
+var float prevLo   = na
+var bool  doneLong  = false        // once per side per day
+var bool  doneShort = false
+
+bool newDay = na(curDay) or barDay != curDay
+if newDay
+    if not na(curDay) and curDay != firstDay
+        prevDay := curDay
+        prevHi  := curHi
+        prevLo  := curLo
+    curDay    := barDay
+    curHi     := high
+    curLo     := low
+    doneLong  := false
+    doneShort := false
+else
+    curHi := math.max(curHi, high)
+    curLo := math.min(curLo, low)
+
+bool hasLevels = not na(prevDay) and barDay - prevDay <= MAX_GAP
+
+// ───────────────────────────── Signal (closed bar) ─────────────────────────────
+// The first close above the previous-day high (below the low) among bars opening from 01:00, once per side per day.
+// A side is used up by its first signal even when no trade follows (outside the entry window or a trade still open).
+bool closed = barstate.isconfirmed
+int  signal = 0
+if closed and hasLevels and barMin >= FROM_MIN
+    if close > prevHi and not doneLong
+        doneLong := true
+        signal   := 1
+    else if close < prevLo and not doneShort
+        doneShort := true
+        signal    := -1
+
+// ───────────────────────────── Orders ─────────────────────────────
+// The fill is at this bar's close (time_close), so the entry window and the 23:00 exit are judged at that moment.
+int endDay = dayOf(time_close)
+int endMin = minuteOf(time_close)
+var int entryDay = na
+
+bool flat = strategy.position_size == 0
+if signal != 0 and flat and endDay == barDay and endMin < TO_MIN
+    float stopLevel = signal > 0 ? prevLo : prevHi
+    float risk      = (close - stopLevel) * signal
+    if risk > 0
+        float target = close + signal * targetR * risk
+        string side  = signal > 0 ? "Long" : "Short"
+        strategy.entry(side, signal > 0 ? strategy.long : strategy.short, qty = qtyIn, alert_message = (signal > 0 ? "BUY " : "SELL ") + syminfo.ticker + " stop " + str.tostring(stopLevel, format.mintick) + " target " + str.tostring(target, format.mintick))
+        strategy.exit(side + " exit", side, stop = stopLevel, limit = target, alert_message = "EXIT " + side + " " + syminfo.ticker + " (stop or target)")
+        entryDay := barDay
+
+// Flat at 23:00 of the entry day, or at the first bar close after it when the market has no bar at 23:00.
+if not flat and (endDay > entryDay or endMin >= FLAT_MIN)
+    strategy.close_all(comment = "23:00", alert_message = "CLOSE " + syminfo.ticker + " (23:00)")
+
+// ───────────────────────────── Plots ─────────────────────────────
+plot(showLevels and hasLevels and not newDay ? prevHi : na, "Previous-day high", highColor, 1, plot.style_linebr)
+plot(showLevels and hasLevels and not newDay ? prevLo : na, "Previous-day low", lowColor, 1, plot.style_linebr)
+plotshape(signal > 0, "Buy signal", shape.triangleup, location.belowbar, highColor, size = size.tiny)
+plotshape(signal < 0, "Sell signal", shape.triangledown, location.abovebar, lowColor, size = size.tiny)
+// For the Data Window and the tests: the signal of each closed bar and the levels it was judged against.
+plot(closed ? signal : na, "Signal (+1 buy, -1 sell)", display = display.data_window)
+plot(hasLevels ? prevHi : na, "Level: previous-day high", display = display.data_window)
+plot(hasLevels ? prevLo : na, "Level: previous-day low", display = display.data_window)
+
+if showTable and barstate.islast
+    var table box = table.new(position.top_right, 2, 5, bgcolor = #1E222D, border_color = #2A2E39, border_width = 1)
+    table.cell(box, 0, 0, "Prior Day Breakout", text_color = #D1D4DC, text_size = size.small)
+    table.cell(box, 1, 0, "FREE", text_color = #787B86, text_size = size.small)
+    table.cell(box, 0, 1, "Settings", text_color = #787B86, text_size = size.small)
+    table.cell(box, 1, 1, (validated ? "validated preset, " : "custom, ") + str.tostring(targetR) + " R", text_color = validated ? #089981 : #D1D4DC, text_size = size.small)
+    table.cell(box, 0, 2, "Previous-day high", text_color = #787B86, text_size = size.small)
+    table.cell(box, 1, 2, hasLevels ? str.tostring(prevHi, format.mintick) : "-", text_color = #D1D4DC, text_size = size.small)
+    table.cell(box, 0, 3, "Previous-day low", text_color = #787B86, text_size = size.small)
+    table.cell(box, 1, 3, hasLevels ? str.tostring(prevLo, format.mintick) : "-", text_color = #D1D4DC, text_size = size.small)
+    table.cell(box, 0, 4, "Position", text_color = #787B86, text_size = size.small)
+    table.cell(box, 1, 4, strategy.position_size > 0 ? "long" : strategy.position_size < 0 ? "short" : "none", text_color = #D1D4DC, text_size = size.small)
